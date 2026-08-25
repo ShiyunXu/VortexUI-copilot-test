@@ -1,0 +1,151 @@
+package subscription
+
+import (
+	"gopkg.in/yaml.v3"
+
+	"github.com/vortexui/vortexui/internal/domain"
+)
+
+// renderClash builds a minimal but valid Clash.Meta config: every proxy, a
+// single selector group containing them all, and a rules section. When rules is
+// empty the rules section is exactly the historical catch-all (`MATCH,<title>`)
+// so output stays byte-identical; when a pack supplies rules they are translated
+// to Clash rule strings followed by a MATCH fallback to the selector group.
+func renderClash(proxies []Proxy, title string, rules []domain.RoutingRule) ([]byte, error) {
+	var clashProxies []map[string]any
+	var names []string
+	for _, p := range proxies {
+		m := clashProxy(p)
+		if m == nil {
+			continue // protocol Clash can't express; skip rather than emit garbage
+		}
+		clashProxies = append(clashProxies, m)
+		names = append(names, p.Name)
+	}
+	if title == "" {
+		title = "VortexUI"
+	}
+
+	clashRuleStrings := []string{"MATCH," + title}
+	if len(rules) > 0 {
+		clashRuleStrings = append(clashRules(rules, title), "MATCH,"+title)
+	}
+
+	cfg := map[string]any{
+		"proxies": clashProxies,
+		"proxy-groups": []map[string]any{
+			{
+				"name":    title,
+				"type":    "select",
+				"proxies": append([]string{"♻️ Auto", "DIRECT"}, names...),
+			},
+			{
+				"name":      "♻️ Auto",
+				"type":      "url-test",
+				"proxies":   names,
+				"url":       "https://www.gstatic.com/generate_204",
+				"interval":  300,
+				"tolerance": 50,
+			},
+		},
+		"rules": clashRuleStrings,
+	}
+	return yaml.Marshal(cfg)
+}
+
+func clashProxy(p Proxy) map[string]any {
+	base := map[string]any{
+		"name":   p.Name,
+		"server": p.Host,
+		"port":   p.Port,
+		"udp":    true,
+	}
+	tls := p.Security == "tls" || p.Security == "reality"
+
+	switch p.Protocol {
+	case domain.ProtoVMess:
+		base["type"] = "vmess"
+		base["uuid"] = p.UUID
+		base["alterId"] = 0
+		base["cipher"] = "auto"
+		base["tls"] = tls
+		applyNetwork(base, p)
+	case domain.ProtoVLESS:
+		base["type"] = "vless"
+		base["uuid"] = p.UUID
+		base["tls"] = tls
+		if p.Flow != "" {
+			base["flow"] = p.Flow
+		}
+		applyNetwork(base, p)
+	case domain.ProtoTrojan:
+		base["type"] = "trojan"
+		base["password"] = p.Password
+		applyNetwork(base, p)
+	case domain.ProtoShadowsocks:
+		base["type"] = "ss"
+		base["cipher"] = p.SSMethod
+		base["password"] = p.Password
+	default:
+		return nil
+	}
+	if tls && p.SNI != "" {
+		base["servername"] = p.SNI
+		base["sni"] = p.SNI
+	}
+	if p.AllowInsecure {
+		base["skip-cert-verify"] = true
+	}
+	if p.Security == "reality" {
+		base["reality-opts"] = map[string]any{"public-key": p.PublicKey, "short-id": p.ShortID}
+		base["client-fingerprint"] = orDefault(p.Fingerprint, "chrome")
+	}
+	// Additive host overrides: only set when present so existing proxies render
+	// identically.
+	if len(p.ALPN) > 0 {
+		base["alpn"] = p.ALPN
+	}
+	if p.Mux {
+		base["smux"] = map[string]any{"enabled": true}
+	}
+	return base
+}
+
+func applyNetwork(base map[string]any, p Proxy) {
+	switch p.Network {
+	case "ws":
+		base["network"] = "ws"
+		opts := map[string]any{}
+		if p.Path != "" {
+			opts["path"] = p.Path
+		}
+		if p.HostHeader != "" {
+			opts["headers"] = map[string]any{"Host": p.HostHeader}
+		}
+		base["ws-opts"] = opts
+	case "grpc":
+		base["network"] = "grpc"
+		base["grpc-opts"] = map[string]any{"grpc-service-name": p.Path}
+	case "httpupgrade":
+		// mihomo expresses HTTPUpgrade as a ws transport with v2ray-http-upgrade.
+		base["network"] = "ws"
+		opts := map[string]any{"v2ray-http-upgrade": true}
+		if p.Path != "" {
+			opts["path"] = p.Path
+		}
+		if p.HostHeader != "" {
+			opts["headers"] = map[string]any{"Host": p.HostHeader}
+		}
+		base["ws-opts"] = opts
+	case "http", "h2":
+		base["network"] = "h2"
+		opts := map[string]any{}
+		if p.Path != "" {
+			opts["path"] = p.Path
+		}
+		if p.HostHeader != "" {
+			opts["host"] = []string{p.HostHeader}
+		}
+		base["h2-opts"] = opts
+	}
+}
